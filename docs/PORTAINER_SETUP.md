@@ -27,7 +27,6 @@ Then open `https://YOUR_SERVER_IP:9443` and create an admin account.
 3. Click **Console**.
 4. Click **Connect**.
 
-![Portainer container list](screenshots/ss6.png)  <!-- optional: cropped to proxy row -->
 ![Container console button](screenshots/ss8.png)
 ![Connected console](screenshots/ss3.png)
 
