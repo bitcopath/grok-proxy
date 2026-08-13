@@ -1,0 +1,35 @@
+services:
+  grok-proxy:
+    build: .
+    container_name: grok-proxy
+    ports:
+      - "${SERVER_PORT:?Set SERVER_PORT in .env}:8080"
+    volumes:
+      - ./data:/app/data:rw
+      - ./logs:/app/logs:rw
+      - "${HOST_GROK_PATH:?Set HOST_GROK_PATH in .env}:/root/.grok:rw"
+      - ./server.js:/app/server.js:ro
+    environment:
+      - PORT=8080
+      - DATA_DIR=/app/data
+      - LOGS_DIR=/app/logs
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LOG_SENSITIVE=${LOG_SENSITIVE:-false}
+      - HOME=/root
+      - PATH=/usr/local/bin:/usr/bin:/bin
+      - GROK_BIN=/usr/local/bin/grok
+      - GROK_TIMEOUT_MS=${GROK_TIMEOUT_MS:-300000}
+      - GROK_MAX_TURNS=${GROK_MAX_TURNS:-8}
+      - GROK_PERMISSION_MODE=${GROK_PERMISSION_MODE:-bypassPermissions}
+      - LOCAL_AI_BASE_URL=${LOCAL_AI_BASE_URL:-}
+      - LOCAL_AI_API_KEY_FILE=${LOCAL_AI_API_KEY_FILE:-}
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    working_dir: /app
+    healthcheck:
+      test: [CMD, curl, -f, http://localhost:8080/health]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

@@ -1,0 +1,22 @@
+{
+  "name": "grok-proxy",
+  "version": "3.0.0",
+  "description": "HTTP proxy for Grok Build CLI with optional local model fallback",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "pino": "^8.16.0"
+  },
+  "keywords": [
+    "grok",
+    "grok-build",
+    "xai",
+    "ai-proxy",
+    "http-proxy",
+    "local-ai",
+    "docker"
+  ],
+  "license": "MIT"
+}
