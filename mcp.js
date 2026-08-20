@@ -50,6 +50,13 @@ const TOOLS = [
 
 const MEDIA_EXT = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'mp4', 'mov', 'webm'];
 
+// Roots the extractor trusts: the shared data dir and Grok's own session
+// output dirs (image_gen often writes there instead of cwd).
+const ALLOWED_ROOTS = [
+  DATA_DIR,
+  process.env.GROK_SESSIONS_DIR || '/root/.grok/sessions'
+];
+
 function rpcResult(id, result) {
   return { jsonrpc: '2.0', id, result };
 }
@@ -62,16 +69,25 @@ function toolText(id, text, isError = false) {
   return rpcResult(id, { content: [{ type: 'text', text }], isError });
 }
 
-function extractMediaPaths(text, dataDir) {
+// Find media file paths in the model output, restricted to ALLOWED_ROOTS,
+// then copy them into DATA_DIR so /files/<name> can serve them.
+function collectMediaFiles(text, requestId, logger) {
   const found = new Set();
-  const re = /(?:\/[\w.\-]+)+\.(png|jpe?g|webp|gif|mp4|mov|webm)/gi;
+  const re = /(?:\/[\w.\-%]+)+\.(png|jpe?g|webp|gif|mp4|mov|webm)/gi;
   let m;
   while ((m = re.exec(text || '')) !== null) {
-    const abs = m[0];
-    // Only expose files that really exist under DATA_DIR (no traversal, no host leaks)
-    const resolved = path.resolve(abs);
-    if (resolved.startsWith(path.resolve(dataDir) + path.sep) && fs.existsSync(resolved)) {
-      found.add(path.basename(resolved));
+    // Note: grok session dirs can literally contain "%2F" — do NOT URL-decode.
+    const resolved = path.resolve(m[0]);
+    const allowed = ALLOWED_ROOTS.some((root) =>
+      resolved.startsWith(path.resolve(root) + path.sep));
+    if (!allowed || !fs.existsSync(resolved)) continue;
+    const dest = path.join(DATA_DIR, `gen_${Date.now()}_${path.basename(resolved)}`);
+    try {
+      fs.copyFileSync(resolved, dest);
+      found.add(path.basename(dest));
+    } catch (error) {
+      logger.warn({ requestId, type: 'mcp_media_copy_failed', src: resolved, error: error.message },
+        `[${requestId}] could not copy generated media ${resolved}`);
     }
   }
   return [...found];
@@ -89,15 +105,15 @@ function createMcpHandler({ runGrok, logger, version }) {
     let maxTurns;
     if (name === 'grok_imagine_image') {
       const ratio = args.ratio ? ` Aspect ratio: ${args.ratio}.` : '';
-      fullPrompt = `Generate an image: ${prompt}.${ratio} Save the file into the current working directory. Reply with the absolute file path(s) of the generated file(s).`;
+      fullPrompt = `Use the image_gen tool to generate this image right now: ${prompt}.${ratio} Save it into the current working directory, then reply with the absolute file path(s) of the generated file(s).`;
       tools = 'image_gen,image_edit';
-      maxTurns = 4;
+      maxTurns = 6;
     } else {
       const duration = Math.min(Math.max(parseInt(args.duration, 10) || 6, 1), 15);
       const resolution = String(args.resolution || '480p') === '720p' ? '720p' : '480p';
-      fullPrompt = `Create a short video clip: ${prompt}. First generate a still image, then animate it into a video. Duration: ${duration}s. Resolution: ${resolution}. Save the file into the current working directory. Reply with the absolute file path(s) of the generated file(s).`;
+      fullPrompt = `Use the image_gen tool to create a still frame of: ${prompt}. Then animate that still into a video with the image_to_video tool. Duration: ${duration}s. Resolution: ${resolution}. Save everything into the current working directory, then reply with the absolute file path(s) of the generated file(s).`;
       tools = 'image_gen,image_to_video';
-      maxTurns = 6;
+      maxTurns = 8;
     }
 
     logger.info({
@@ -121,7 +137,7 @@ function createMcpHandler({ runGrok, logger, version }) {
       return { error: `generation failed: ${error.message}` };
     }
 
-    const files = extractMediaPaths(result.response, DATA_DIR);
+    const files = collectMediaFiles(result.response, requestId, logger);
     if (!files.length) {
       logger.warn({ requestId, type: 'mcp_imagine_no_files', tool: name },
         `[${requestId}] MCP ${name} produced no parseable files`);
