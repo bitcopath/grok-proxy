@@ -74,6 +74,9 @@ The only value you really need is `HOST_GROK_PATH`.
 | `GROK_MAX_TURNS` | Max tool/agent steps per request. | `8` |
 | `GROK_PERMISSION_MODE` | Keep `bypassPermissions` for headless runs. | `bypassPermissions` |
 | `LOCAL_AI_BASE_URL` | Optional free local model. | `http://your-pc:8080/v1` |
+| `PROXY_API_KEY` | Optional Bearer key for `/v1/*` and `/mcp`. | _(empty = LAN open)_ |
+| `GROK_V1_MODEL` | Model id reported by `/v1/models`. | `grok-build` |
+| `GROK_MEDIA_TIMEOUT_MS` | Timeout for MCP media generation. | `600000` (10 min) |
 | `LOG_LEVEL` | How chatty the logs are. | `info` |
 | `LOG_SENSITIVE` | Set to `true` only while debugging. | `false` |
 
@@ -166,6 +169,58 @@ Returns `{"status":"ok"}` when the proxy is alive.
 ### `GET /providers`
 
 Returns a human-readable tip about when to use Grok vs local model.
+
+---
+
+## OpenAI-compatible endpoint (`/v1`)
+
+The proxy also speaks the standard OpenAI chat-completions protocol, so tools
+that expect an OpenAI API (agent harnesses, OpenAI SDKs) can use your Super
+Grok membership as a model.
+
+### `GET /v1/models`
+
+Returns `grok-build`, plus `local-qwen` when `LOCAL_AI_BASE_URL` is set.
+
+### `POST /v1/chat/completions`
+
+Standard OpenAI request body: `messages`, optional `tools`, `stream`,
+`temperature`, `max_tokens`.
+
+- `model: "grok-build"` → headless Grok brain. **Brain-only**: the CLI runs
+  with `--permission-mode dontAsk` + `--max-turns 1`, so it cannot execute
+  anything (verified: tool calls are auto-denied).
+- `model: "local-qwen"` → transparently forwarded to your local endpoint
+  (including SSE passthrough when `stream:true`).
+- **Tool calling**: OpenAI `tools` schemas are enforced through Grok's native
+  `--json-schema` constrained output and returned as standard `tool_calls`.
+- **Streaming**: `stream:true` returns real token-level SSE chunks.
+- Point any OpenAI client at `http://YOUR_SERVER_IP:8084/v1` (API key only
+  needed if you set `PROXY_API_KEY`).
+
+---
+
+## MCP media tools (`/mcp`)
+
+A minimal [Model Context Protocol](https://modelcontextprotocol.io) endpoint
+(streamable HTTP, JSON-RPC) exposing Grok Imagine as MCP tools — usable from
+any MCP client (DeepSeek Harness, Kimi CLI, Claude Code, ...).
+
+| Tool | Arguments | What it does |
+|------|-----------|--------------|
+| `grok_imagine_image` | `prompt`, `ratio?` | Generate/edit a still image |
+| `grok_imagine_video` | `prompt`, `duration?`, `resolution?` | Short clip (still → animation, max 720p) |
+
+Generated files are saved in the proxy's data dir and returned as HTTP URLs
+served by the proxy itself:
+
+### `GET /files/<name>`
+
+Serves generated media (path-traversal safe), so MCP clients on other
+machines can fetch the results.
+
+Add to any MCP client as a streamable-http server: `http://YOUR_SERVER_IP:8084/mcp`
+(headers: `Authorization: Bearer <PROXY_API_KEY>` if you set one).
 
 ---
 

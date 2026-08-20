@@ -13,7 +13,7 @@ const path = require('path');
 // ============================================================================
 // Configuration
 // ============================================================================
-const SERVICE_VERSION = '3.0.0';
+const SERVICE_VERSION = '3.1.0';
 const PORT = process.env.PORT || 8080;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const LOGS_DIR = process.env.LOGS_DIR || path.join(__dirname, 'logs');
@@ -123,8 +123,14 @@ function runGrok(prompt, sessionId, requestId, options = {}) {
     }
 
     args.push('-p', prompt);
-    args.push('--output-format', 'json');
-    args.push('--permission-mode', GROK_PERMISSION_MODE);
+    if (options.streamMessages) {
+      // Anthropic-wire NDJSON stream (deltas consumed via options.onLine)
+      args.push('--output-format', 'streaming-messages-json');
+      args.push('--include-partial-messages');
+    } else {
+      args.push('--output-format', 'json');
+    }
+    args.push('--permission-mode', options.permissionMode || GROK_PERMISSION_MODE);
     args.push('--no-auto-update');
 
     if (options.model) {
@@ -136,6 +142,11 @@ function runGrok(prompt, sessionId, requestId, options = {}) {
 
     if (options.tools) {
       args.push('--tools', options.tools);
+    }
+
+    // Extra CLI flags (e.g. ['--json-schema', schema] for the /v1 contract mode)
+    if (Array.isArray(options.extraArgs) && options.extraArgs.length) {
+      args.push(...options.extraArgs);
     }
 
     if (!fs.existsSync(DATA_DIR)) {
@@ -163,11 +174,29 @@ function runGrok(prompt, sessionId, requestId, options = {}) {
     let output = '';
     let stderr = '';
     let firstDataTime = null;
+    let lineBuf = '';
 
     grok.stdout.on('data', (d) => {
       if (!firstDataTime) firstDataTime = Date.now();
       const chunk = d.toString();
       output += chunk;
+
+      // NDJSON line callback for streaming consumers (the /v1 surface)
+      if (options.onLine) {
+        lineBuf += chunk;
+        let idx;
+        while ((idx = lineBuf.indexOf('\n')) >= 0) {
+          const line = lineBuf.slice(0, idx).trim();
+          lineBuf = lineBuf.slice(idx + 1);
+          if (line) {
+            try {
+              options.onLine(JSON.parse(line));
+            } catch {
+              // non-JSON line — ignore
+            }
+          }
+        }
+      }
       logger.debug({
         requestId,
         type: 'grok_stdout_chunk',
@@ -187,10 +216,11 @@ function runGrok(prompt, sessionId, requestId, options = {}) {
       }, `[${requestId}] stderr (${chunk.length} chars)`);
     });
 
+    const timeoutMs = options.timeoutMs || GROK_TIMEOUT_MS;
     const timeout = setTimeout(() => {
       grok.kill();
-      reject(new Error(`Grok timeout after ${GROK_TIMEOUT_MS}ms`));
-    }, GROK_TIMEOUT_MS);
+      reject(new Error(`Grok timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
 
     grok.on('close', (code) => {
       clearTimeout(timeout);
@@ -401,6 +431,18 @@ async function runLocalQwen(prompt, requestId, options = {}) {
 }
 
 // ============================================================================
+// OpenAI-compatible /v1 surface (see openai.js)
+// ============================================================================
+const { createV1Handler } = require('./openai');
+const v1 = createV1Handler({ runGrok, readLocalApiKey, logger });
+
+// ============================================================================
+// MCP media surface (see mcp.js)
+// ============================================================================
+const { createMcpHandler } = require('./mcp');
+const mcp = createMcpHandler({ runGrok, logger, version: SERVICE_VERSION });
+
+// ============================================================================
 // HTTP server
 // ============================================================================
 const server = http.createServer(async (req, res) => {
@@ -409,11 +451,46 @@ const server = http.createServer(async (req, res) => {
 
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(200);
     res.end();
+    return;
+  }
+
+  const reqPath = (req.url || '').split('?')[0];
+
+  // Generated media files (from MCP imagine tools) — path-traversal safe
+  if (reqPath.startsWith('/files/') && req.method === 'GET') {
+    const name = decodeURIComponent(reqPath.slice('/files/'.length));
+    const safe = path.basename(name); // strips any directory components
+    const full = path.join(DATA_DIR, safe);
+    if (!safe || safe !== name || !fs.existsSync(full)) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not found' }));
+      return;
+    }
+    const ext = path.extname(safe).toLowerCase();
+    const mime = {
+      '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+      '.webp': 'image/webp', '.gif': 'image/gif',
+      '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm'
+    }[ext] || 'application/octet-stream';
+    res.writeHead(200, { 'Content-Type': mime });
+    fs.createReadStream(full).pipe(res);
+    return;
+  }
+
+  // OpenAI-compatible surface: GET /v1/models
+  if (reqPath === '/v1/models' && req.method === 'GET') {
+    if (!v1.authorized(req)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'invalid API key', type: 'invalid_request_error', param: null, code: 'invalid_api_key' } }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(v1.modelsPayload()));
     return;
   }
 
@@ -473,6 +550,29 @@ const server = http.createServer(async (req, res) => {
       }, `[${requestId}] HTTP ${req.method} ${req.url} (${body.length} chars)`);
 
       const data = JSON.parse(body);
+
+      // MCP endpoint (initialize / tools/list / tools/call)
+      if (reqPath === '/mcp') {
+        if (!v1.authorized(req)) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: data && data.id != null ? data.id : null, error: { code: -32001, message: 'invalid API key' } }));
+          return;
+        }
+        await mcp.handleMcp(req, res, requestId, data);
+        return;
+      }
+
+      // OpenAI-compatible chat completions → headless Grok brain (or local model)
+      if (reqPath === '/v1/chat/completions') {
+        if (!v1.authorized(req)) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'invalid API key', type: 'invalid_request_error', param: null, code: 'invalid_api_key' } }));
+          return;
+        }
+        await v1.handleChat(req, res, requestId, data);
+        return;
+      }
+
       const provider = (data.provider || 'grok').toLowerCase();
       const sessionId = data.sessionId || null;
       const imagePath = data.imagePath || null;
